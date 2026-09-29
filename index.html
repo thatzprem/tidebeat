@@ -24,6 +24,9 @@
   #sailstat { font-size: 13px; margin-top: 4px; letter-spacing: 1px; }
   #sailstat.good { color: #7dffb0; }
   #sailstat.bad { color: #ffb08a; }
+  #trimhint { font-size: 13px; margin-top: 4px; letter-spacing: 1px; min-height: 16px; color: #ffe08a; }
+  #trimhint.ok { color: #7dffb0; }
+  #headhint { font-size: 13px; margin-top: 4px; letter-spacing: 1px; min-height: 16px; color: #ff9a8a; }
   #stam { width: 220px; height: 16px; background: rgba(0,0,0,0.5); border-radius: 8px; overflow: hidden; margin-top: 6px; border: 1px solid rgba(255,255,255,0.25); }
   #stamfill { height: 100%; width: 100%; background: linear-gradient(90deg, #35d67a, #b7ff5a); transition: width 0.1s linear; }
   #stamfill.tired { background: linear-gradient(90deg, #ff4a3c, #ff9a3c); }
@@ -88,6 +91,8 @@
   .location { position: absolute; right: 5.5vw; bottom: 120px; text-align: right; font-size: 10px; letter-spacing: 3px; line-height: 2; color: #fff4da; }
   .location span { display: block; opacity: .65; letter-spacing: 1px; }
   #hud-bc { box-shadow: none; backdrop-filter: none; padding: 0; }
+  #hud-tc { top: 170px; left: 28px; padding: 8px; }
+  #minimap { display: block; width: 168px; height: 228px; }
   #mult { color: #f4ce91; font-size: 25px; text-shadow: none; }
   #judge { font-size: 12px; }
   #ring-target { border-width: 2px; box-shadow: 0 0 15px #f9cf8833; }
@@ -105,10 +110,12 @@
     .controls { left: 26px; right: 26px; bottom: 22px; gap: 12px; flex-wrap: wrap; font-size: 9px; }
     .location { display: none; }
     .race-meta { gap: 24px; margin-bottom: 24px; }
-    #hud-tl { top: 14px; left: 14px; } #hud-tr { right: 14px; top: 70px; }
+    #hud-tl { top: 14px; left: 14px; } #hud-tr { right: 14px; top: 124px; }
     .panel { padding: 12px 14px; } .big { font-size: 26px; }
     #hud-bl { left: 14px; bottom: 18px; min-width: 110px; } #stam { width: 110px; }
     #hud-bc { left: auto; right: 12px; transform: none; } #mutebtn { top: 14px; right: 14px; }
+    #hud-tc { top: 120px; left: 14px; padding: 6px; }
+    #minimap { width: 112px; height: 152px; }
   }
   @media (max-height: 650px) {
     #menu h1 { font-size: 60px; margin-bottom: 14px; } .eyebrow { margin-bottom: 14px; }
@@ -136,11 +143,14 @@
       <svg id="windarrow" viewBox="0 0 40 40"><path d="M20 3 L32 22 L24 22 L24 37 L16 37 L16 22 L8 22 Z" fill="#7de3ff" stroke="#053a4a" stroke-width="1.5"/></svg>
     </div>
     <div id="sailstat">SAIL 0&deg;</div>
+    <div id="trimhint"></div>
+    <div id="headhint"></div>
   </div>
   <div id="hud-bl" class="panel">
     <div class="small">crew stamina</div>
     <div id="stam"><div id="stamfill"></div></div>
   </div>
+  <div id="hud-tc" class="panel"><canvas id="minimap" width="336" height="456"></canvas></div>
   <div id="hud-bc" class="panel">
     <div id="beat"><div id="ring-target" class="ring"></div><div id="ring-move" class="ring"></div></div>
     <div id="mult">1x</div>
@@ -191,6 +201,30 @@ const GATE_PENALTY = 3;
 const COUNTDOWN_SECONDS = 3;
 const SAIL_LIMIT = 80 * Math.PI / 180;
 const SAIL_TRIM_RATE = 60 * Math.PI / 180;
+
+// Wind is the engine; rowing is a supplement. The wind blows from ahead (up
+// the course), so a straight line is upwind and the boat has to tack.
+const WIND_ACCEL = 18;            // m/s^2 of drive at polar 1.0 with perfect trim
+const ROW_SCALE = 0.6;             // rowing gain relative to the old rowing-only game
+const NO_GO = 35 * Math.PI / 180;  // closer than this to the wind: sail stalls
+const TRIM_TOLERANCE = 40 * Math.PI / 180;
+const WIND_SWING = 0.6;            // wind stays within +/-34 deg of dead ahead
+// Drive fraction by true wind angle (degrees off the wind; 0 = head to wind).
+const POLAR = [[0, 0], [35, 0], [50, 0.6], [90, 0.95], [130, 1], [180, 0.7]];
+function polar(twa) {
+  const d = twa * 180 / Math.PI;
+  for (let i = 1; i < POLAR.length; i++) {
+    if (d <= POLAR[i][0]) {
+      const a = POLAR[i - 1], b = POLAR[i];
+      return a[1] + (b[1] - a[1]) * (d - a[0]) / (b[0] - a[0]);
+    }
+  }
+  return POLAR[POLAR.length - 1][1];
+}
+function pointOfSail(twa) {
+  const d = twa * 180 / Math.PI;
+  return d < 35 ? 'IN IRONS' : d < 70 ? 'CLOSE-HAULED' : d < 110 ? 'BEAM REACH' : d < 160 ? 'BROAD REACH' : 'RUNNING';
+}
 
 // Two summed sine waves. Shared by the water shader (GLSL) and the JS
 // sampler so the visible water and the boat motion agree exactly.
@@ -393,7 +427,7 @@ const boatGroup = new THREE.Group();
 boatGroup.rotation.order = 'YXZ';
 scene.add(boatGroup);
 const crew = [];       // crew groups (lean via rotation.x)
-let sailPivot, sailMesh, sailBase = null, sailUV = null;
+let sailPivot, sailMesh, sailBase = null, sailUV = null, windVane;
 
 (function buildBoat() {
   const hullMat = new THREE.MeshPhongMaterial({ color: 0x5c3418, shininess: 40 });
@@ -440,9 +474,14 @@ let sailPivot, sailMesh, sailBase = null, sailUV = null;
   const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.16, 7.4, 8), woodMat);
   mast.position.set(0, 0.6 + 3.7, 0.3);
   boatGroup.add(mast);
-  const pennant = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.4), new THREE.MeshBasicMaterial({ color: 0xff3b2e, side: THREE.DoubleSide }));
-  pennant.position.set(0.5, 8.0, 0.3);
-  boatGroup.add(pennant);
+  // Wind vane at the masthead: a streamer that points downwind (see updateVisuals).
+  windVane = new THREE.Group();
+  windVane.position.set(0, 8.1, 0.3);
+  const pennant = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 0.55), new THREE.MeshBasicMaterial({ color: 0xff3b2e, side: THREE.DoubleSide }));
+  pennant.rotation.y = Math.PI / 2;               // long axis along the vane's local +z
+  pennant.position.z = 1.3;
+  windVane.add(pennant);
+  boatGroup.add(windVane);
 
   // Sail: a plane tapered into a triangle. Luff along the mast, foot aft (-z).
   const sg = new THREE.PlaneGeometry(4.2, 6.2, 6, 9);
@@ -516,7 +555,7 @@ let sailPivot, sailMesh, sailBase = null, sailUV = null;
    COURSE: buoy gates + finish line
    ===================================================================== */
 const buoys = [];   // { group, x, z }
-const gates = [];   // { z, passed }
+const gates = [];   // { x, z, passed }
 (function buildCourse() {
   const orangeMat = new THREE.MeshPhongMaterial({ color: 0xff7a1a, shininess: 60 });
   const poleMat = new THREE.MeshPhongMaterial({ color: 0x3a2a1a });
@@ -524,8 +563,9 @@ const gates = [];   // { z, passed }
   const poleGeo = new THREE.CylinderGeometry(0.09, 0.12, 1.6, 6);
   const baseGeo = new THREE.CylinderGeometry(0.7, 0.9, 0.35, 10);
   for (let gz = GATE_SPACING; gz < COURSE_LENGTH; gz += GATE_SPACING) {
-    gates.push({ z: gz, passed: false });
-    for (const sx of [-GATE_HALF_WIDTH, GATE_HALF_WIDTH]) {
+    const gx = 0;                                   // gates are centred on the course line
+    gates.push({ x: gx, z: gz, passed: false });
+    for (const sx of [gx - GATE_HALF_WIDTH, gx + GATE_HALF_WIDTH]) {
       const g = new THREE.Group();
       const base = new THREE.Mesh(baseGeo, poleMat); base.position.y = 0.1; g.add(base);
       const pole = new THREE.Mesh(poleGeo, poleMat); pole.position.y = 1.0; g.add(pole);
@@ -593,9 +633,12 @@ const sim = {
   lastQuality: '',
   lastQualityTime: -10,
   sailAngle: 0.5,
-  sailBonus: 1,
+  sailTarget: 0,                       // optimal sail angle for the current wind (HUD hint)
+  trim: 0,                             // 0..1, how well the sail is set for the wind
+  drive: 0,                            // wind acceleration applied this step (m/s^2)
+  twa: 0,                              // true wind angle: 0 = head to wind, PI = dead run
   sailErr: 0,
-  wind: { dir: 0, timer: 0, next: 10 },
+  wind:{ dir: 0, timer: 0, next: 10 },
   results: null,
   penaltyFlash: 0,
 };
@@ -730,7 +773,7 @@ function judgeTap() {
    ===================================================================== */
 function resetWind() {
   rngState = 20240915;
-  sim.wind.dir = (rand() - 0.5) * Math.PI * 1.2;
+  sim.wind.dir = Math.PI + (rand() - 0.5) * WIND_SWING;   // blows toward -z, i.e. at the boat
   sim.wind.timer = 0;
   sim.wind.next = 8 + rand() * 4;
 }
@@ -739,7 +782,8 @@ function updateWind(dt) {
   if (sim.wind.timer >= sim.wind.next) {
     sim.wind.timer = 0;
     sim.wind.next = 8 + rand() * 4;                 // shifts every 8 to 12 seconds
-    sim.wind.dir = wrapAngle(sim.wind.dir + (rand() - 0.5) * Math.PI * 0.9);
+    const shifted = wrapAngle(sim.wind.dir - Math.PI + (rand() - 0.5) * 0.8);
+    sim.wind.dir = Math.PI + clamp(shifted, -WIND_SWING, WIND_SWING);
   }
 }
 // Optimal sail angle for the wind relative to the boat: let the sail right
@@ -754,11 +798,17 @@ function updateSail(dt) {
   if (input.down) sim.sailAngle -= SAIL_TRIM_RATE * dt;
   sim.sailAngle = clamp(sim.sailAngle, -SAIL_LIMIT, SAIL_LIMIT);
   const rel = wrapAngle(sim.wind.dir - sim.boat.heading);
-  let err = Math.abs(sim.sailAngle - optimalSail(rel));
-  if (Math.abs(rel) < 0.35) err = Math.min(err, Math.abs(sim.sailAngle - optimalSail(-rel)));  // dead downwind: either tack
+  let target = optimalSail(rel);
+  let err = Math.abs(sim.sailAngle - target);
+  if (Math.abs(rel) < 0.35) {                      // dead downwind: either tack
+    const alt = optimalSail(-rel);
+    if (Math.abs(sim.sailAngle - alt) < err) { target = alt; err = Math.abs(sim.sailAngle - alt); }
+  }
+  sim.sailTarget = target;
   sim.sailErr = err;
-  const within = 20 * Math.PI / 180;
-  sim.sailBonus = 1 + 0.4 * Math.max(0, 1 - err / within);
+  sim.trim = Math.max(0, 1 - err / TRIM_TOLERANCE);
+  sim.twa = Math.PI - Math.abs(rel);
+  sim.drive = WIND_ACCEL * polar(sim.twa) * sim.trim;
 }
 function applyStroke(quality) {
   if (sim.state !== 'RACING') return;
@@ -770,8 +820,8 @@ function applyStroke(quality) {
   if (sim.exhausted) { factor = 0.4; cost *= 0.25; }
   sim.stamina = Math.max(0, sim.stamina - cost);
   if (sim.stamina <= 0) sim.exhausted = true;
-  const gain = (2.0 + 0.55 * m) * sim.sailBonus * factor * (quality === 'miss' ? 0.6 : 1);
-  sim.boat.v = Math.min(sim.boat.v + gain, 26 * sim.sailBonus);
+  const gain = (2.0 + 0.55 * m) * ROW_SCALE * factor * (quality === 'miss' ? 0.6 : 1);
+  sim.boat.v = Math.min(sim.boat.v + gain, 26);
   sim.strokes++;
   sim.lastStrokeTime = sim.simTime;
   sim.strokePhase = 1;
@@ -807,7 +857,12 @@ function stepPhysics(dt) {
     }
   }
   if (turning) b.v *= Math.max(0, 1 - 0.7 * dt);   // sharp turns bleed speed
-  b.v -= (0.55 * b.v + 0.004 * b.v * b.v) * dt;
+  let dragK = 0.55;
+  if (sim.state === 'RACING') {
+    b.v += sim.drive * dt;
+    if (sim.twa < NO_GO) dragK += 0.4;             // pinching into the wind: flogging sail adds drag
+  }
+  b.v -= (dragK * b.v + 0.004 * b.v * b.v) * dt;
   if (b.v < 0) b.v = 0;
   const prevZ = b.z;
   b.x += Math.sin(b.heading) * b.v * dt;
@@ -818,7 +873,7 @@ function stepPhysics(dt) {
       const g = gates[i];
       if (!g.passed && prevZ < g.z && b.z >= g.z) {
         g.passed = true;
-        if (Math.abs(b.x) <= GATE_HALF_WIDTH) sim.gatesClean++;
+        if (Math.abs(b.x - g.x) <= GATE_HALF_WIDTH) sim.gatesClean++;
         else { sim.penalties++; sim.penaltyFlash = 1; }
       }
     }
@@ -831,7 +886,7 @@ function stepPhysics(dt) {
    ===================================================================== */
 const ui = {
   hud: $('hud'), time: $('time'), dist: $('dist'), pen: $('pen'), speed: $('speed'),
-  windarrow: $('windarrow'), sailstat: $('sailstat'), stamfill: $('stamfill'),
+  windarrow: $('windarrow'), sailstat: $('sailstat'), trimhint: $('trimhint'), headhint: $('headhint'), stamfill: $('stamfill'),
   ringTarget: $('ring-target'), ringMove: $('ring-move'), mult: $('mult'), judge: $('judge'),
   flash: $('flash'), flashmsg: $('flashmsg'), menu: $('menu'), countdown: $('countdown'), count: $('count'),
   results: $('results'), resStars: $('res-stars'), resTime: $('res-time'), resGates: $('res-gates'), resPen: $('res-pen'),
@@ -839,6 +894,172 @@ const ui = {
 function fmtTime(s) {
   const m = Math.floor(s / 60), r = s - m * 60;
   return m + ':' + (r < 10 ? '0' : '') + r.toFixed(2);
+}
+// Steering hints are relative to the next target: the next unpassed gate, or the
+// finish centre. A "layline" is the line through the target along a close-hauled
+// heading (TACK_ANGLE off the wind): sail out to one, tack onto it, and you lay the
+// target without another turn. Turning left raises the heading.
+const TACK_ANGLE = 0.84;           // ~48 deg off the wind
+function nextTarget() {
+  for (let i = 0; i < gates.length; i++) if (!gates[i].passed) return { x: gates[i].x, z: gates[i].z };
+  return { x: 0, z: COURSE_LENGTH };
+}
+// Signed distance from the boat to the layline through target `tg` on tack side s (+1/-1).
+function laylineOffset(b, tg, src, s) {
+  const h = src + s * TACK_ANGLE;
+  return (b.x - tg.x) * Math.cos(h) - (b.z - tg.z) * Math.sin(h);
+}
+// The route the minimap suggests: boat -> tack point -> target. If the target can be
+// laid directly (>= TACK_ANGLE off the wind) there is no tack point. Otherwise sail
+// a close-hauled heading until it meets the target's layline for the other tack.
+// Returns null when the target is behind the boat.
+function planRoute(b, tg, src) {
+  if (tg.z <= b.z) return null;
+  const bearing = Math.atan2(tg.x - b.x, tg.z - b.z);
+  if (Math.abs(wrapAngle(bearing - src)) >= TACK_ANGLE - 0.03) return { tack: null };
+  const gx = tg.x - b.x, gz = tg.z - b.z;
+  const first = laylineOffset(b, tg, src, -1) < 0 ? 1 : -1;
+  for (const s of [first, -first]) {
+    const hs = src + s * TACK_ANGLE, ho = src - s * TACK_ANGLE;
+    const sx = Math.sin(hs), sz = Math.cos(hs), ox = Math.sin(ho), oz = Math.cos(ho);
+    const D = sx * oz - sz * ox;
+    if (Math.abs(D) < 1e-6) continue;
+    const t = (gx * oz - gz * ox) / D, u = (sx * gz - sz * gx) / D;   // b + t*hs = tg - u*ho
+    if (t > 0 && u > 0) return { tack: { x: b.x + sx * t, z: b.z + sz * t, dist: t } };
+  }
+  return { tack: null };
+}
+function headingHint() {
+  const b = sim.boat, tg = nextTarget();
+  const src = sim.wind.dir + Math.PI;                       // direction the wind comes from
+  const off = wrapAngle(b.heading - src);
+  const turnKey = (target) => wrapAngle(target - b.heading) > 0 ? '←' : '→';
+  if (sim.twa < NO_GO) {
+    let s = wrapAngle(Math.atan2(tg.x - b.x, tg.z - b.z) - src) >= 0 ? 1 : -1;      // tack on the target's side of the wind
+    return 'TURN ' + turnKey(src + s * TACK_ANGLE) + ' AWAY FROM WIND';
+  }
+  // On a close-hauled tack and reaching the layline of the other tack: time to tack.
+  if (sim.twa < 75 * Math.PI / 180 && tg.z > b.z) {
+    const s = off >= 0 ? 1 : -1;
+    if (Math.abs(laylineOffset(b, tg, src, -s)) < 6) return 'TACK NOW: TURN ' + turnKey(src - s * TACK_ANGLE);
+  }
+  return '';
+}
+// Minimap: top-down, course direction up, boat fixed near the bottom. X is
+// mirrored so it matches the chase camera (looking down +z, +x is on the left).
+// Left strip shows progress over the whole course; the panel shows the next
+// gates, the wind, the no-go fan and the two tack lines around it.
+const mm = { canvas: $('minimap'), W: 168, H: 228, DPR: 2, S: 0.8, stripW: 12, trail: [] };
+mm.ctx = mm.canvas.getContext('2d');
+mm.x0 = mm.stripW + 6;                       // left edge of the map area
+mm.cx = mm.x0 + (mm.W - mm.x0) / 2;          // boat position in the map area
+mm.cy = 170;
+function drawMinimap(t) {
+  if (ui.hud.hidden) return;
+  const c = mm.ctx, b = sim.boat, S = mm.S, W = mm.W, H = mm.H, x0 = mm.x0;
+  const X = (x) => mm.cx - (x - b.x) * S, Y = (z) => mm.cy - (z - b.z) * S;
+  const trail = mm.trail;
+  if (sim.state === 'RACING') {
+    const last = trail[trail.length - 1];
+    if (!last || Math.hypot(b.x - last.x, b.z - last.z) > 3) { trail.push({ x: b.x, z: b.z }); if (trail.length > 150) trail.shift(); }
+  }
+  c.setTransform(mm.DPR, 0, 0, mm.DPR, 0, 0);
+  c.clearRect(0, 0, W, H);
+
+  // Progress strip.
+  const prog = clamp(b.z / COURSE_LENGTH, 0, 1);
+  c.fillStyle = 'rgba(255,255,255,0.14)'; c.fillRect(3, 4, 6, H - 8);
+  c.fillStyle = '#58bfa4'; c.fillRect(3, 4 + (H - 8) * (1 - prog), 6, (H - 8) * prog);
+  c.fillStyle = '#ffb35a';
+  for (let i = 0; i < gates.length; i++) c.fillRect(1, 4 + (H - 8) * (1 - gates[i].z / COURSE_LENGTH) - 0.5, 10, 1.5);
+
+  c.save();
+  c.beginPath(); c.rect(x0, 0, W - x0, H); c.clip();
+  c.fillStyle = 'rgba(10,58,68,0.92)'; c.fillRect(x0, 0, W - x0, H);
+
+  // Wind streaks drifting the way the wind blows.
+  const wdx = -Math.sin(sim.wind.dir), wdy = -Math.cos(sim.wind.dir);
+  c.lineCap = 'round'; c.lineWidth = 1;
+  for (let i = 0; i < 12; i++) {
+    const o = (t * 16 + i * 17) % 44;
+    const px = x0 + ((i * 53) % (W - x0)) + wdx * o, py = ((i * 97) % H) + wdy * o;
+    c.strokeStyle = 'rgba(190,235,255,' + (0.35 * Math.sin(o / 44 * Math.PI)).toFixed(2) + ')';
+    c.beginPath(); c.moveTo(px, py); c.lineTo(px + wdx * 9, py + wdy * 9); c.stroke();
+  }
+
+  // No-go fan (into the wind): kept faint so it doesn't compete with the route.
+  const src = sim.wind.dir + Math.PI;
+  const bx = mm.cx, by = mm.cy;
+  c.fillStyle = 'rgba(255,80,60,0.14)'; c.strokeStyle = 'rgba(255,130,110,0.3)'; c.lineWidth = 1;
+  c.beginPath(); c.moveTo(bx, by);
+  for (let k = 0; k <= 8; k++) { const a = src - NO_GO + (2 * NO_GO * k) / 8; c.lineTo(bx - Math.sin(a) * 90, by - Math.cos(a) * 90); }
+  c.closePath(); c.fill(); c.stroke();
+
+  // The suggested route to the next target: boat -> tack point -> gate. One line only.
+  const nextIdx = gates.findIndex((g) => !g.passed);
+  const tg = nextTarget();
+  const route = planRoute(b, tg, src);
+  if (route) {
+    c.strokeStyle = '#ffe06e'; c.lineWidth = 2.5; c.lineJoin = 'round'; c.lineCap = 'round';
+    c.beginPath(); c.moveTo(bx, by);
+    if (route.tack) c.lineTo(X(route.tack.x), Y(route.tack.z));
+    c.lineTo(X(tg.x), Y(tg.z)); c.stroke();
+    if (route.tack) {                                       // tack marker: a diamond that pulses when close
+      const kx = X(route.tack.x), ky = Y(route.tack.z), near = route.tack.dist < 20;
+      const r = 5 + (near ? 2 * Math.sin(t * 10) : 0);
+      c.fillStyle = near ? '#ffffff' : '#ffe06e'; c.strokeStyle = '#3a2a05'; c.lineWidth = 1.5;
+      c.beginPath(); c.moveTo(kx, ky - r); c.lineTo(kx + r, ky); c.lineTo(kx, ky + r); c.lineTo(kx - r, ky); c.closePath(); c.fill(); c.stroke();
+    }
+  }
+
+  // Gates (orange buoys) and the finish line. The next gate is bright and ringed; the rest recede.
+  for (let i = 0; i < gates.length; i++) {
+    const g = gates[i], y = Y(g.z), isNext = i === nextIdx;
+    if (y < -8 || y > H + 8) continue;
+    const a = g.passed ? 0.2 : (isNext ? 0.9 : 0.35);
+    c.strokeStyle = 'rgba(255,240,200,' + a + ')'; c.lineWidth = isNext ? 1.5 : 1;
+    c.setLineDash([3, 3]); c.beginPath(); c.moveTo(X(g.x - GATE_HALF_WIDTH), y); c.lineTo(X(g.x + GATE_HALF_WIDTH), y); c.stroke(); c.setLineDash([]);
+    c.fillStyle = g.passed ? 'rgba(255,122,26,0.35)' : (isNext ? '#ff7a1a' : 'rgba(255,122,26,0.55)');
+    for (const sx of [g.x - GATE_HALF_WIDTH, g.x + GATE_HALF_WIDTH]) { c.beginPath(); c.arc(X(sx), y, isNext ? 4 : 3, 0, Math.PI * 2); c.fill(); }
+    if (isNext) {                                           // pulsing ring around the target gate
+      c.strokeStyle = 'rgba(255,224,110,' + (0.35 + 0.35 * Math.sin(t * 4)).toFixed(2) + ')'; c.lineWidth = 1.5;
+      c.beginPath(); c.arc(X(g.x), y, GATE_HALF_WIDTH * S + 8, 0, Math.PI * 2); c.stroke();
+    }
+  }
+  const fy = Y(COURSE_LENGTH);
+  if (fy > -8 && fy < H + 8) {
+    c.strokeStyle = '#ff5a3c'; c.lineWidth = 2;
+    c.beginPath(); c.moveTo(X(-FINISH_HALF_WIDTH), fy); c.lineTo(X(FINISH_HALF_WIDTH), fy); c.stroke();
+  }
+
+  // Trail and boat.
+  if (trail.length > 1) {
+    c.strokeStyle = 'rgba(255,255,255,0.35)'; c.lineWidth = 1.5; c.beginPath();
+    for (let i = 0; i < trail.length; i++) { const px = X(trail[i].x), py = Y(trail[i].z); if (i) c.lineTo(px, py); else c.moveTo(px, py); }
+    c.lineTo(bx, by); c.stroke();
+  }
+  const hx = -Math.sin(b.heading), hy = -Math.cos(b.heading);
+  c.fillStyle = '#fff5df'; c.beginPath();
+  c.moveTo(bx + hx * 10, by + hy * 10);
+  c.lineTo(bx - hx * 6 - hy * 5, by - hy * 6 + hx * 5);
+  c.lineTo(bx - hx * 6 + hy * 5, by - hy * 6 - hx * 5);
+  c.closePath(); c.fill();
+
+  // Wind arrow (points where the wind blows) and next-target caption.
+  const ax = W - 22, ay = 30;
+  c.strokeStyle = '#7de3ff'; c.fillStyle = '#7de3ff'; c.lineWidth = 2;
+  c.beginPath(); c.moveTo(ax - wdx * 11, ay - wdy * 11); c.lineTo(ax + wdx * 11, ay + wdy * 11); c.stroke();
+  c.beginPath(); c.moveTo(ax + wdx * 13, ay + wdy * 13);
+  c.lineTo(ax + wdx * 4 - wdy * 5, ay + wdy * 4 + wdx * 5); c.lineTo(ax + wdx * 4 + wdy * 5, ay + wdy * 4 - wdx * 5); c.closePath(); c.fill();
+  c.font = '9px "Segoe UI", sans-serif'; c.textAlign = 'center'; c.fillText('WIND', ax, ay + 24);
+  const caption = nextIdx >= 0 ? 'GATE ' + (nextIdx + 1) + '/' + gates.length + ' · ' + Math.max(0, Math.round(gates[nextIdx].z - b.z)) + ' m'
+                               : 'FINISH · ' + Math.max(0, Math.round(COURSE_LENGTH - b.z)) + ' m';
+  c.fillStyle = '#fff5df'; c.textAlign = 'left'; c.fillText(caption, x0 + 6, H - 8);
+  if (route) {                                              // what to do next, right above the caption
+    c.font = 'bold 10px "Segoe UI", sans-serif'; c.fillStyle = '#ffe06e';
+    c.fillText(route.tack ? 'TACK IN ' + Math.max(0, Math.round(route.tack.dist)) + ' m' : (nextIdx >= 0 ? 'HEAD FOR GATE' : 'HEAD FOR FINISH'), x0 + 6, H - 22);
+  }
+  c.restore();
 }
 let lastCountShown = -1, lastFlash = 0;
 function updateHUD() {
@@ -851,9 +1072,22 @@ function updateHUD() {
   const rel = wrapAngle(sim.wind.dir - b.heading);
   ui.windarrow.style.transform = 'rotate(' + (-rel * 180 / Math.PI).toFixed(1) + 'deg)';
   const deg = Math.round(sim.sailAngle * 180 / Math.PI);
-  const trimmed = sim.sailBonus > 1.02;
-  ui.sailstat.textContent = 'SAIL ' + deg + '° · ' + (trimmed ? 'DRAWING x' + sim.sailBonus.toFixed(2) : 'LUFFING');
-  ui.sailstat.className = trimmed ? 'good' : 'bad';
+  const racing = sim.state === 'RACING';
+  const drawing = racing && sim.drive > 0.5;
+  const pos = racing ? pointOfSail(sim.twa) + ' · ' : '';
+  ui.sailstat.textContent = pos + 'SAIL ' + deg + '° · ' + (drawing ? 'DRIVE ' + Math.round(100 * sim.drive / WIND_ACCEL) + '%' : 'LUFFING');
+  ui.sailstat.className = drawing ? 'good' : 'bad';
+  // Trim hint: which key moves the sail toward its best angle for this wind.
+  const trimDiff = sim.sailTarget - sim.sailAngle;
+  let hint = '', hintOk = false;
+  if (racing) {
+    if (Math.abs(trimDiff) < 4 * Math.PI / 180) { hint = 'SAIL TRIMMED'; hintOk = true; }
+    else hint = trimDiff > 0 ? '▲ TRIM (↑ / W)' : '▼ TRIM (↓ / S)';
+  }
+  ui.trimhint.textContent = hint;
+  ui.trimhint.classList.toggle('ok', hintOk);
+  ui.headhint.textContent = racing ? headingHint() : '';
+  drawMinimap(waveTime);
   ui.stamfill.style.width = sim.stamina.toFixed(1) + '%';
   ui.stamfill.classList.toggle('tired', sim.exhausted);
   ui.mult.textContent = sim.mult + 'x';
@@ -926,7 +1160,7 @@ function beginRacing() {
 }
 function finishRace() {
   const time = Math.round((sim.elapsed + sim.penalties * GATE_PENALTY) * 100) / 100;
-  const stars = time < 75 ? 3 : (time < 95 ? 2 : 1);
+  const stars = time < 125 ? 3 : (time < 180 ? 2 : 1);
   sim.results = { time, gates: sim.gatesClean, penalties: sim.penalties, stars };
   showResults(sim.results);
   setState('FINISHED');
@@ -939,11 +1173,12 @@ function reset() {
   sim.stamina = 100; sim.exhausted = false;
   sim.mult = 1; sim.strokes = 0; sim.lastStrokeTime = -10; sim.strokePhase = 0;
   sim.lastQuality = ''; sim.lastQualityTime = -10;
-  sim.sailAngle = 0.5; sim.sailBonus = 1; sim.sailErr = 0;
+  sim.sailAngle = 0.5; sim.sailTarget = 0; sim.trim = 0; sim.drive = 0; sim.twa = 0; sim.sailErr = 0;
   sim.results = null; sim.penaltyFlash = 0;
   input.left = input.right = input.up = input.down = false;
   for (let i = 0; i < gates.length; i++) gates[i].passed = false;
   resetWind();
+  mm.trail.length = 0;
   camState.init = false;
   ui.flash.classList.remove('on'); ui.flashmsg.hidden = true; lastFlash = 0;
   setState('MENU');
@@ -992,9 +1227,13 @@ function updateVisuals(dt) {
     c.pivot.rotation.z = c.side * (0.5 + lift);  // outboard tilt; more tilt raises the blade clear
   }
 
+  // Wind vane: local +z points where the wind is blowing to, with a little flutter.
+  windVane.rotation.y = wrapAngle(sim.wind.dir - b.heading) + Math.sin(t * 9) * 0.08;
+  windVane.rotation.z = Math.sin(t * 13) * 0.12;
+
   // Sail: pivot to trim angle, billow when drawing, luff when badly trimmed.
   sailPivot.rotation.y = sim.sailAngle;
-  const draw = clamp((sim.sailBonus - 1) / 0.4, 0, 1);
+  const draw = clamp(sim.drive / WIND_ACCEL, 0, 1);
   const luff = (sim.state === 'RACING' || sim.state === 'FINISHED') ? (1 - draw) * 0.9 : 0.25;
   const pos = sailMesh.geometry.attributes.position;
   const arr = pos.array;
@@ -1074,6 +1313,9 @@ window.__test = {
   get distance() { return Math.max(0, sim.boat.z); },
   get results() { return sim.results; },
   _sim: sim,
+  _input: input,
+  _gates: gates,
+  optimalSail,
   _snapCamera() { camState.init = false; },
 };
 
